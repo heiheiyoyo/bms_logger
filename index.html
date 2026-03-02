@@ -1,0 +1,680 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>🔋 BMS 电池数据记录器</title>
+  <link rel="manifest" href="manifest.json" />
+  <meta name="theme-color" content="#00e5ff" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="BMS记录器" />
+  <link rel="apple-touch-icon" href="icon-192.png" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body { margin: 0; background: #080e0e; color: #e0e0e0; font-family: -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif; }
+    input[type=number]::-webkit-inner-spin-button,
+    input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+    input[type=number] { -moz-appearance: textfield; }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #0a1212; }
+    ::-webkit-scrollbar-thumb { background: #1a3a3a; border-radius: 3px; }
+    textarea { resize: vertical; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script type="text/babel" data-presets="react">
+const { useState, useCallback, useRef, useEffect } = React;
+
+const STORAGE_KEY = "battery-bms-records-v3";
+const API_URL = "https://www.dmxapi.cn/v1/messages";
+const API_KEY = atob("bjh5ZmpzM0J2cEhzQlgzdDVydGxLbEZHdG1vd2tuWDhlZ0JhemJjeHFtZVp3SDJzLWtz").split("").reverse().join("");
+const MODEL = "claude-sonnet-4-20250514";
+
+// ── API ──────────────────────────────────────────────────────────────────────
+async function extractBatteryData(base64Image, mediaType) {
+  const prompt = [
+    "Extract all battery BMS data from this screenshot.",
+    "Return ONLY a JSON object with these fields (use null if not found):",
+    "{",
+    '  "soc_percent": number,',
+    '  "status": "charging or discharging or idle",',
+    '  "time_remaining_min": number (e.g. 4小时26分钟=266),',
+    '  "voltage_v": number,',
+    '  "current_a": number (positive=charging, negative=discharging),',
+    '  "capacity_ah": number,',
+    '  "remaining_ah": number,',
+    '  "cell_count": number,',
+    '  "series_count": number,',
+    '  "chemistry": "string e.g. 三元 or LFP or 磷酸铁锂",',
+    '  "max_cell_voltage_v": number,',
+    '  "min_cell_voltage_v": number,',
+    '  "cell_voltage_diff_mv": number (压差 in mV),',
+    '  "max_temp_c": number,',
+    '  "min_temp_c": number,',
+    '  "mos_temp_c": number,',
+    '  "balance_temp_c": number,',
+    '  "t1_c": number,',
+    '  "t2_c": number,',
+    '  "t3_c": number,',
+    '  "t4_c": number,',
+    '  "discharge_circuit": "on or off",',
+    '  "charge_circuit": "on or off",',
+    '  "cell_voltages": [array of numbers in order from C1 to CN],',
+    '  "alerts": ["list of active warning or fault names visible on screen"],',
+    '  "notes": "any other observations"',
+    "}",
+    "Return ONLY valid JSON. No markdown, no extra text."
+  ].join("\n");
+
+  const response = await fetch(API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": API_KEY,
+      "anthropic-version": "2023-06-01"
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      max_tokens: 1500,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: mediaType, data: base64Image } },
+          { type: "text", text: prompt }
+        ]
+      }]
+    })
+  });
+  const data = await response.json();
+  if (data.type === "error") throw new Error(data.error?.message || "API 错误");
+  if (!data.content || !Array.isArray(data.content)) throw new Error("API 返回格式异常: " + JSON.stringify(data).slice(0, 120));
+  const text = data.content.map(b => b.text || "").join("");
+  const clean = text.replace(/```json|```/g, "").trim();
+  const parsed = JSON.parse(clean);
+  parsed.timestamp = new Date().toISOString();
+  return parsed;
+}
+
+// ── CSV ───────────────────────────────────────────────────────────────────────
+const BASE_FIELDS = [
+  "timestamp","odometer_km","status","soc_percent","time_remaining_min",
+  "voltage_v","current_a","capacity_ah","remaining_ah",
+  "cell_count","series_count","chemistry",
+  "max_cell_voltage_v","min_cell_voltage_v","cell_voltage_diff_mv",
+  "max_temp_c","min_temp_c","mos_temp_c","balance_temp_c",
+  "t1_c","t2_c","t3_c","t4_c",
+  "discharge_circuit","charge_circuit","alerts","notes"
+];
+
+function buildCSV(records) {
+  if (!records.length) return "";
+  const maxCells = Math.max(...records.map(r => (r.cell_voltages || []).length), 0);
+  const cellHeaders = Array.from({ length: maxCells }, (_, i) => `cell_${i+1}_v`);
+  const headers = [...BASE_FIELDS, ...cellHeaders];
+  const esc = (v) => {
+    if (v == null) return "";
+    const s = Array.isArray(v) ? v.join("; ") : String(v);
+    return (s.includes(",") || s.includes('"') || s.includes("\n"))
+      ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const rows = records.map(r => {
+    const cells = r.cell_voltages || [];
+    return [
+      ...BASE_FIELDS.map(f => esc(r[f])),
+      ...Array.from({ length: maxCells }, (_, i) => esc(cells[i]))
+    ].join(",");
+  });
+  return "\uFEFF" + [headers.join(","), ...rows].join("\r\n");
+}
+
+function downloadCSV(records) {
+  const csv = buildCSV(records);
+  if (!csv) return;
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `battery_data_${new Date().toISOString().slice(0,10)}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function parseCSV(text) {
+  // Strip BOM
+  const t = text.replace(/^\uFEFF/, "");
+  const lines = t.split(/\r?\n/).filter(l => l.trim());
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(",").map(h => h.trim().replace(/^"|"$/g, ""));
+  return lines.slice(1).map(line => {
+    // Simple CSV parse (handles quoted fields)
+    const vals = [];
+    let cur = "", inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (c === '"') { inQ = !inQ; }
+      else if (c === "," && !inQ) { vals.push(cur); cur = ""; }
+      else { cur += c; }
+    }
+    vals.push(cur);
+    const obj = {};
+    headers.forEach((h, i) => {
+      const v = (vals[i] || "").trim();
+      if (v === "") { obj[h] = null; return; }
+      if (h.startsWith("cell_") && h.endsWith("_v")) return; // handled below
+      if (["soc_percent","time_remaining_min","voltage_v","current_a","capacity_ah","remaining_ah",
+           "cell_count","series_count","max_cell_voltage_v","min_cell_voltage_v","cell_voltage_diff_mv",
+           "max_temp_c","min_temp_c","mos_temp_c","balance_temp_c","t1_c","t2_c","t3_c","t4_c","odometer_km"].includes(h)) {
+        const n = parseFloat(v); obj[h] = isNaN(n) ? null : n;
+      } else if (h === "alerts") {
+        obj[h] = v ? v.split("; ").filter(Boolean) : [];
+      } else {
+        obj[h] = v;
+      }
+    });
+    // Reconstruct cell_voltages
+    const cellVals = [];
+    headers.forEach((h, i) => {
+      if (h.startsWith("cell_") && h.endsWith("_v")) {
+        const v = vals[i] !== undefined && vals[i] !== "" ? parseFloat(vals[i]) : null;
+        if (v != null) cellVals.push(v);
+      }
+    });
+    if (cellVals.length) obj.cell_voltages = cellVals;
+    return obj;
+  }).filter(r => r && r.timestamp);
+}
+
+// ── Storage ───────────────────────────────────────────────────────────────────
+function loadRecords() {
+  try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]"); } catch { return []; }
+}
+function persistRecords(recs) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(recs)); } catch {}
+}
+
+// ── Components ────────────────────────────────────────────────────────────────
+function StatCard({ label, value, unit, color }) {
+  const c = color || "#00e5ff";
+  return (
+    <div style={{ background: "rgba(255,255,255,0.04)", border: `1px solid ${c}22`, borderRadius: 10, padding: "10px 14px", minWidth: 100 }}>
+      <div style={{ color: "#888", fontSize: 10, textTransform: "uppercase", letterSpacing: 1, marginBottom: 3 }}>{label}</div>
+      <div style={{ color: c, fontSize: 19, fontWeight: 700, fontFamily: "monospace" }}>
+        {value != null ? value : "—"}
+        {value != null && unit && <span style={{ fontSize: 11, color: "#666", marginLeft: 3 }}>{unit}</span>}
+      </div>
+    </div>
+  );
+}
+
+function OdometerIcon({ size = 16 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" style={{ display:"inline-block", verticalAlign:"middle" }}>
+      <circle cx="12" cy="12" r="10" stroke="#f0c040" strokeWidth="1.5" fill="none" opacity="0.25"/>
+      <path d="M5 16 A8 8 0 0 1 19 16" stroke="#f0c040" strokeWidth="2" strokeLinecap="round" fill="none"/>
+      <path d="M12 12 L8.5 8.5" stroke="#ff6b35" strokeWidth="2" strokeLinecap="round"/>
+      <circle cx="12" cy="12" r="1.5" fill="#f0c040"/>
+      <line x1="8.5" y1="14" x2="9.5" y2="14" stroke="#f0c040" strokeWidth="1.2" strokeLinecap="round" opacity="0.6"/>
+      <line x1="14.5" y1="14" x2="15.5" y2="14" stroke="#f0c040" strokeWidth="1.2" strokeLinecap="round" opacity="0.6"/>
+      <line x1="12" y1="5.5" x2="12" y2="6.5" stroke="#f0c040" strokeWidth="1.2" strokeLinecap="round" opacity="0.6"/>
+    </svg>
+  );
+}
+
+function StatusBadge({ status, timeMin }) {
+  if (!status) return null;
+  const isCharging = status === "charging";
+  const isDischarging = status === "discharging";
+  const color = isCharging ? "#39ff14" : isDischarging ? "#ff9800" : "#888";
+  const bg = isCharging ? "rgba(57,255,20,0.1)" : isDischarging ? "rgba(255,152,0,0.1)" : "rgba(136,136,136,0.1)";
+  const label = isCharging ? "⚡ 充电中" : isDischarging ? "▶ 放电中" : "● 静置";
+  const fmtTime = (min) => {
+    if (!min) return null;
+    const h = Math.floor(min / 60), m = min % 60;
+    return h > 0 ? `${h}h${m > 0 ? m + "m" : ""}` : `${m}m`;
+  };
+  return (
+    <span style={{ background: bg, border: `1px solid ${color}44`, color, borderRadius: 6, padding: "2px 8px", fontSize: 12, fontWeight: 700, display: "inline-flex", alignItems: "center", gap: 4 }}>
+      {label}
+      {timeMin != null && <span style={{ color: color + "bb", fontWeight: 400, fontSize: 11 }}>~{fmtTime(timeMin)}</span>}
+    </span>
+  );
+}
+
+function ConfirmModal({ message, confirmLabel = "确认删除", onConfirm, onCancel }) {
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 2000, display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div style={{ background: "#0d1a1a", border: "1px solid #ff444444", borderRadius: 12, padding: "24px 28px", maxWidth: 340, width: "90%", textAlign: "center" }}>
+        <div style={{ fontSize: 28, marginBottom: 12 }}>🗑</div>
+        <div style={{ color: "#ddd", fontSize: 14, marginBottom: 20, lineHeight: 1.6 }}>{message}</div>
+        <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+          <button onClick={onConfirm} style={{ background: "#ff4444", color: "#fff", border: "none", borderRadius: 8, padding: "8px 22px", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>{confirmLabel}</button>
+          <button onClick={onCancel} style={{ background: "none", color: "#aaa", border: "1px solid #333", borderRadius: 8, padding: "8px 22px", fontSize: 13, cursor: "pointer" }}>取消</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RecordRow({ record, index, onDelete, onUpdateOdometer }) {
+  const [expanded, setExpanded] = useState(index === 0);
+  const [editingOdo, setEditingOdo] = useState(false);
+  const [odoVal, setOdoVal] = useState(record.odometer_km != null ? String(record.odometer_km) : "");
+  const [showConfirm, setShowConfirm] = useState(false);
+
+  const saveOdo = () => {
+    const km = parseFloat(odoVal.replace(/,/g, ""));
+    onUpdateOdometer(index, isNaN(km) ? null : km);
+    setEditingOdo(false);
+  };
+
+  return (
+    <div style={{ background: "rgba(255,255,255,0.03)", border: "1px solid #1a2a2a", borderRadius: 8, marginBottom: 8, overflow: "hidden" }}>
+      {showConfirm && (
+        <ConfirmModal
+          message={`确定删除第 #${index + 1} 条记录？此操作不可撤销。`}
+          onConfirm={() => { setShowConfirm(false); onDelete(index); }}
+          onCancel={() => setShowConfirm(false)}
+        />
+      )}
+      <div onClick={() => setExpanded(!expanded)}
+        style={{ display: "flex", alignItems: "center", gap: 10, padding: "11px 14px", cursor: "pointer", userSelect: "none", flexWrap: "wrap" }}>
+        <span style={{ color: "#555", fontSize: 12, minWidth: 22 }}>#{index + 1}</span>
+        <span style={{ color: "#00e5ff", fontFamily: "monospace", fontSize: 12, flex: 1, minWidth: 140 }}>
+          {new Date(record.timestamp).toLocaleString("zh-CN")}
+        </span>
+        {record.status && <StatusBadge status={record.status} timeMin={record.time_remaining_min} />}
+        {record.odometer_km != null && (
+          <span style={{ color: "#f0c040", fontWeight: 700, fontSize: 12, display: "flex", alignItems: "center", gap: 3 }}>
+            <OdometerIcon size={13} /> {record.odometer_km.toLocaleString()} km
+          </span>
+        )}
+        <span style={{ color: "#39ff14", fontWeight: 700, minWidth: 44 }}>{record.soc_percent ?? "?"}%</span>
+        <span style={{ color: "#aaa", fontSize: 12, minWidth: 56 }}>{record.voltage_v ?? "?"}V</span>
+        <span style={{ color: "#aaa", fontSize: 12, minWidth: 52 }}>{record.current_a ?? "?"}A</span>
+        <button onClick={e => { e.stopPropagation(); setShowConfirm(true); }}
+          style={{ background: "none", border: "1px solid #ff4444", color: "#ff4444", borderRadius: 4, padding: "2px 7px", cursor: "pointer", fontSize: 11 }}>
+          删除
+        </button>
+        <span style={{ color: "#555", fontSize: 11 }}>{expanded ? "▲" : "▼"}</span>
+      </div>
+
+      {expanded && (
+        <div style={{ padding: "0 14px 14px", borderTop: "1px solid #111" }}>
+          {/* Odometer */}
+          <div style={{ marginTop: 10, marginBottom: 10, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <OdometerIcon size={13} />
+            <span style={{ color: "#f0c040", fontSize: 11, fontWeight: 600 }}>里程表</span>
+            {editingOdo ? (
+              <>
+                <input autoFocus type="number" value={odoVal}
+                  onChange={e => setOdoVal(e.target.value)}
+                  onKeyDown={e => { if (e.key === "Enter") saveOdo(); if (e.key === "Escape") setEditingOdo(false); }}
+                  placeholder="输入里程 km"
+                  style={{ background: "#0a1212", border: "1px solid #f0c04066", borderRadius: 6, color: "#f0c040", fontSize: 14, fontWeight: 700, fontFamily: "monospace", padding: "3px 8px", width: 120, outline: "none" }}
+                />
+                <span style={{ color: "#8a7030", fontSize: 11 }}>km</span>
+                <button onClick={saveOdo} style={{ background: "#f0c040", color: "#000", border: "none", borderRadius: 5, padding: "3px 10px", fontWeight: 700, fontSize: 11, cursor: "pointer" }}>保存</button>
+                <button onClick={() => setEditingOdo(false)} style={{ background: "none", color: "#555", border: "1px solid #333", borderRadius: 5, padding: "3px 7px", fontSize: 11, cursor: "pointer" }}>取消</button>
+              </>
+            ) : (
+              <>
+                <span style={{ color: record.odometer_km != null ? "#f0c040" : "#444", fontFamily: "monospace", fontSize: 13, fontWeight: 700 }}>
+                  {record.odometer_km != null ? record.odometer_km.toLocaleString() + " km" : "未记录"}
+                </span>
+                <button onClick={() => { setOdoVal(record.odometer_km != null ? String(record.odometer_km) : ""); setEditingOdo(true); }}
+                  style={{ background: "none", border: "1px solid #f0c04044", color: "#f0c040", borderRadius: 5, padding: "2px 7px", fontSize: 10, cursor: "pointer" }}>
+                  ✏ 编辑
+                </button>
+              </>
+            )}
+          </div>
+
+          {/* Stats */}
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 7 }}>
+            <StatCard label="电量" value={record.soc_percent} unit="%" color="#39ff14" />
+            <StatCard label="总电压" value={record.voltage_v} unit="V" />
+            <StatCard label="电流" value={record.current_a} unit="A" color="#ff9800" />
+            <StatCard label="容量" value={record.capacity_ah} unit="Ah" color="#9c27b0" />
+            <StatCard label="剩余" value={record.remaining_ah} unit="Ah" color="#9c27b0" />
+            <StatCard label="最高单压" value={record.max_cell_voltage_v} unit="V" color="#39ff14" />
+            <StatCard label="最低单压" value={record.min_cell_voltage_v} unit="V" color="#ff4444" />
+            {record.cell_voltage_diff_mv != null && <StatCard label="压差" value={record.cell_voltage_diff_mv} unit="mV" color="#ffcc00" />}
+            <StatCard label="最高温" value={record.max_temp_c} unit="°C" color="#ff6b6b" />
+            <StatCard label="最低温" value={record.min_temp_c} unit="°C" color="#4fc3f7" />
+            {record.mos_temp_c != null && <StatCard label="MOS温" value={record.mos_temp_c} unit="°C" color="#ff9800" />}
+            {record.balance_temp_c != null && <StatCard label="均衡温" value={record.balance_temp_c} unit="°C" color="#ff9800" />}
+            {record.t1_c != null && <StatCard label="T1" value={record.t1_c} unit="°C" color="#4fc3f7" />}
+            {record.t2_c != null && <StatCard label="T2" value={record.t2_c} unit="°C" color="#4fc3f7" />}
+            {record.t3_c != null && <StatCard label="T3" value={record.t3_c} unit="°C" color="#4fc3f7" />}
+            {record.t4_c != null && <StatCard label="T4" value={record.t4_c} unit="°C" color="#4fc3f7" />}
+          </div>
+
+          {/* Cell voltages */}
+          {record.cell_voltages && record.cell_voltages.length > 0 && (
+            <div style={{ marginTop: 10 }}>
+              <div style={{ color: "#555", fontSize: 10, textTransform: "uppercase", letterSpacing: 1, marginBottom: 6 }}>单体电压</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+                {record.cell_voltages.map((v, i) => {
+                  const isMax = v === record.max_cell_voltage_v;
+                  const isMin = v === record.min_cell_voltage_v;
+                  return (
+                    <span key={i} style={{
+                      background: isMax ? "rgba(57,255,20,0.1)" : isMin ? "rgba(255,68,68,0.1)" : "rgba(0,229,255,0.05)",
+                      border: `1px solid ${isMax ? "#39ff1444" : isMin ? "#ff444444" : "#00e5ff22"}`,
+                      borderRadius: 5, padding: "3px 8px", fontSize: 11, fontFamily: "monospace",
+                      color: isMax ? "#39ff14" : isMin ? "#ff6666" : "#00e5ff"
+                    }}>C{i+1}: {v}V</span>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Alerts */}
+          {record.alerts && record.alerts.length > 0 && (
+            <div style={{ marginTop: 10, display: "flex", flexWrap: "wrap", gap: 5 }}>
+              {record.alerts.map((a, i) => (
+                <span key={i} style={{ background: "#1a0a00", border: "1px solid #ff660033", borderRadius: 5, padding: "3px 8px", color: "#ff9944", fontSize: 11 }}>⚠ {a}</span>
+              ))}
+            </div>
+          )}
+
+          {/* Notes */}
+          {record.notes && (
+            <div style={{ marginTop: 8, padding: "7px 10px", background: "#1a1a00", border: "1px solid #ffcc0033", borderRadius: 6, color: "#ffcc00", fontSize: 11 }}>
+              {record.notes}
+            </div>
+          )}
+
+          {/* Circuits */}
+          <div style={{ marginTop: 8, display: "flex", gap: 14, fontSize: 11, color: "#555", flexWrap: "wrap" }}>
+            {record.discharge_circuit && <span>放电回路: <span style={{ color: record.discharge_circuit === "on" ? "#39ff14" : "#ff4444" }}>{record.discharge_circuit.toUpperCase()}</span></span>}
+            {record.charge_circuit && <span>充电回路: <span style={{ color: record.charge_circuit === "on" ? "#39ff14" : "#ff4444" }}>{record.charge_circuit.toUpperCase()}</span></span>}
+            {record.chemistry && <span>化学体系: <span style={{ color: "#ccc" }}>{record.chemistry}</span></span>}
+            {record.series_count && <span>串数: <span style={{ color: "#ccc" }}>{record.series_count}S</span></span>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────────
+function App() {
+  const [records, setRecords] = useState(() => loadRecords());
+  const [loading, setLoading] = useState(false);
+  const [loadingText, setLoadingText] = useState("");
+  const [error, setError] = useState("");
+  const [dragOver, setDragOver] = useState(false);
+  const [lastAdded, setLastAdded] = useState(null);
+  const [odometerInput, setOdometerInput] = useState("");
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [importMsg, setImportMsg] = useState("");
+  const fileRef = useRef();
+  const importRef = useRef();
+
+  const saveRecords = (recs) => {
+    setRecords(recs);
+    persistRecords(recs);
+  };
+
+  const processFiles = async (files) => {
+    const imgFiles = Array.from(files).filter(f => f.type.startsWith("image/"));
+    if (!imgFiles.length) { setError("请上传图片文件"); return; }
+    setLoading(true);
+    setError("");
+    const results = [];
+    for (let i = 0; i < imgFiles.length; i++) {
+      setLoadingText(`正在解析第 ${i+1}/${imgFiles.length} 张...`);
+      try {
+        const base64 = await new Promise((res, rej) => {
+          const reader = new FileReader();
+          reader.onload = () => res(reader.result.split(",")[1]);
+          reader.onerror = rej;
+          reader.readAsDataURL(imgFiles[i]);
+        });
+        const data = await extractBatteryData(base64, imgFiles[i].type);
+        if (odometerInput.trim()) {
+          const km = parseFloat(odometerInput.replace(/,/g, ""));
+          if (!isNaN(km)) data.odometer_km = km;
+        }
+        results.push(data);
+      } catch (e) {
+        setError(`第${i+1}张解析失败: ${e.message}`);
+      }
+    }
+    if (results.length) {
+      const newRecords = [...results.reverse(), ...records];
+      saveRecords(newRecords);
+      setLastAdded(results[results.length - 1]);
+    }
+    setLoading(false);
+    setLoadingText("");
+  };
+
+  const handleDrop = useCallback((e) => {
+    e.preventDefault();
+    setDragOver(false);
+    processFiles(e.dataTransfer.files);
+  }, [records, odometerInput]);
+
+  const handleImport = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const imported = parseCSV(ev.target.result);
+        if (!imported.length) { setImportMsg("❌ 未找到有效数据"); return; }
+        // Merge: deduplicate by timestamp
+        const existing = new Set(records.map(r => r.timestamp));
+        const newOnes = imported.filter(r => !existing.has(r.timestamp));
+        const merged = [...records, ...newOnes].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+        saveRecords(merged);
+        setImportMsg(`✅ 已导入 ${newOnes.length} 条新记录（跳过 ${imported.length - newOnes.length} 条重复）`);
+        setTimeout(() => setImportMsg(""), 4000);
+      } catch (err) {
+        setImportMsg("❌ 解析失败: " + err.message);
+      }
+    };
+    reader.readAsText(file, "utf-8");
+    e.target.value = "";
+  };
+
+  const deleteRecord = (idx) => saveRecords(records.filter((_, i) => i !== idx));
+  const updateOdometer = (idx, km) => saveRecords(records.map((r, i) => i === idx ? { ...r, odometer_km: km } : r));
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#080e0e", color: "#e0e0e0" }}>
+      {showClearConfirm && (
+        <ConfirmModal
+          message={`确定清除全部 ${records.length} 条记录？此操作不可撤销。`}
+          onConfirm={() => { setShowClearConfirm(false); saveRecords([]); }}
+          onCancel={() => setShowClearConfirm(false)}
+        />
+      )}
+
+      {/* Header */}
+      <div style={{ background: "linear-gradient(135deg,#0a1f1f,#081414)", borderBottom: "1px solid #00e5ff22", padding: "14px 20px", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
+        <div>
+          <h1 style={{ margin: 0, fontSize: 17, fontWeight: 800, color: "#00e5ff" }}>🔋 BMS 电池数据记录器</h1>
+          <div style={{ color: "#446666", fontSize: 11, marginTop: 2 }}>上传截图 → AI解析 → 自动记录 → 导出 CSV</div>
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <span style={{ background: "rgba(0,229,255,0.08)", border: "1px solid #00e5ff33", color: "#00e5ff", borderRadius: 20, padding: "4px 11px", fontSize: 12, fontWeight: 600 }}>
+            {records.length} 条记录
+          </span>
+          {/* Import */}
+          <input ref={importRef} type="file" accept=".csv" style={{ display: "none" }} onChange={handleImport} />
+          <button onClick={() => importRef.current && importRef.current.click()}
+            style={{ background: "rgba(0,229,255,0.08)", color: "#00e5ff", border: "1px solid #00e5ff44", borderRadius: 8, padding: "7px 12px", fontWeight: 600, fontSize: 12, cursor: "pointer" }}>
+            ⬆ 导入 CSV
+          </button>
+          {/* Export */}
+          <button onClick={() => downloadCSV(records)} disabled={!records.length}
+            style={{ background: records.length ? "linear-gradient(135deg,#39ff14,#00cc11)" : "#1a2a1a", color: records.length ? "#000" : "#333", border: "none", borderRadius: 8, padding: "7px 14px", fontWeight: 700, fontSize: 12, cursor: records.length ? "pointer" : "not-allowed" }}>
+            ⬇ 导出 CSV
+          </button>
+          <button onClick={() => setShowClearConfirm(true)} disabled={!records.length}
+            style={{ background: "none", color: records.length ? "#ff4444" : "#333", border: `1px solid ${records.length ? "#ff4444" : "#222"}`, borderRadius: 8, padding: "7px 11px", fontWeight: 600, fontSize: 12, cursor: records.length ? "pointer" : "not-allowed" }}>
+            清空
+          </button>
+        </div>
+      </div>
+
+      <div style={{ maxWidth: 940, margin: "0 auto", padding: "18px 14px" }}>
+
+        {/* Import status */}
+        {importMsg && (
+          <div style={{ background: importMsg.startsWith("✅") ? "rgba(57,255,20,0.07)" : "rgba(255,68,68,0.07)", border: `1px solid ${importMsg.startsWith("✅") ? "#39ff1444" : "#ff444444"}`, borderRadius: 8, padding: "9px 14px", fontSize: 13, marginBottom: 14, color: importMsg.startsWith("✅") ? "#39ff14" : "#ff6666" }}>
+            {importMsg}
+          </div>
+        )}
+
+        {/* Upload Zone */}
+        <div onDrop={handleDrop}
+          onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+          onDragLeave={() => setDragOver(false)}
+          onClick={() => !loading && fileRef.current && fileRef.current.click()}
+          style={{ border: `2px dashed ${dragOver ? "#00e5ff" : loading ? "#ffcc00" : "#1a3a3a"}`, borderRadius: 14, padding: "32px 20px", textAlign: "center", cursor: loading ? "wait" : "pointer", background: dragOver ? "rgba(0,229,255,0.04)" : "rgba(255,255,255,0.02)", transition: "all 0.2s", marginBottom: 14 }}>
+          <input ref={fileRef} type="file" accept="image/*" multiple style={{ display: "none" }} onChange={e => processFiles(e.target.files)} />
+          {loading ? (
+            <div>
+              <div style={{ fontSize: 28, marginBottom: 8 }}>⚡</div>
+              <div style={{ color: "#ffcc00", fontSize: 14, fontWeight: 600 }}>{loadingText}</div>
+              <div style={{ color: "#555", fontSize: 12, marginTop: 4 }}>AI 正在识别截图中的电池数据...</div>
+            </div>
+          ) : (
+            <div>
+              <div style={{ fontSize: 32, marginBottom: 8 }}>📸</div>
+              <div style={{ color: "#ccc", fontSize: 14, fontWeight: 600, marginBottom: 3 }}>拖放 BMS 截图到这里，或点击选择</div>
+              <div style={{ color: "#444", fontSize: 11 }}>支持充电 / 放电 / 静置界面截图，JPG、PNG，可多张同时上传</div>
+            </div>
+          )}
+        </div>
+
+        {/* Odometer */}
+        <div style={{ background: "rgba(240,192,64,0.05)", border: "1px solid #f0c04033", borderRadius: 12, padding: "12px 14px", marginBottom: 14, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          <OdometerIcon size={20} />
+          <div style={{ flex: 1, minWidth: 180 }}>
+            <div style={{ color: "#f0c040", fontSize: 11, fontWeight: 700, marginBottom: 5 }}>里程表读数（可选）</div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              <div style={{ position: "relative", display: "flex", alignItems: "center" }}>
+                <input type="number" value={odometerInput} onChange={e => setOdometerInput(e.target.value)}
+                  placeholder="例如 4789"
+                  style={{ background: "#0a1212", border: "1px solid #f0c04044", borderRadius: 8, color: "#f0c040", fontSize: 15, fontWeight: 700, fontFamily: "monospace", padding: "7px 44px 7px 12px", width: 150, outline: "none" }}
+                />
+                <span style={{ position: "absolute", right: 10, color: "#8a7030", fontSize: 11 }}>km</span>
+              </div>
+              <span style={{ color: "#445", fontSize: 11 }}>上传截图时自动附加，或单独记录：</span>
+              <button onClick={() => {
+                const km = parseFloat(odometerInput.replace(/,/g, ""));
+                if (!odometerInput.trim() || isNaN(km)) { setError("请输入有效的里程数"); return; }
+                const rec = { timestamp: new Date().toISOString(), odometer_km: km, type: "odometer_only" };
+                saveRecords([rec, ...records]);
+                setLastAdded(rec);
+                setOdometerInput("");
+              }} style={{ background: odometerInput ? "linear-gradient(135deg,#f0c040,#c0900a)" : "#1a1500", color: odometerInput ? "#000" : "#444", border: "none", borderRadius: 8, padding: "7px 12px", fontWeight: 700, fontSize: 11, cursor: odometerInput ? "pointer" : "not-allowed", whiteSpace: "nowrap" }}>
+                + 单独记录里程
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {error && (
+          <div style={{ background: "#1a0808", border: "1px solid #ff444433", borderRadius: 8, padding: "9px 13px", color: "#ff6666", fontSize: 12, marginBottom: 12 }}>
+            ⚠ {error} <button onClick={() => setError("")} style={{ background: "none", border: "none", color: "#ff6666", cursor: "pointer", float: "right", fontSize: 14 }}>×</button>
+          </div>
+        )}
+
+        {/* Last Added Preview */}
+        {lastAdded && (
+          <div style={{ background: "linear-gradient(135deg,rgba(57,255,20,0.04),rgba(0,229,255,0.04))", border: "1px solid #39ff1422", borderRadius: 12, padding: 13, marginBottom: 18 }}>
+            <div style={{ color: "#39ff14", fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: 1, marginBottom: 8, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              ✓ 最新解析结果
+              {lastAdded.status && <StatusBadge status={lastAdded.status} timeMin={lastAdded.time_remaining_min} />}
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 7 }}>
+              <StatCard label="电量" value={lastAdded.soc_percent} unit="%" color="#39ff14" />
+              <StatCard label="总电压" value={lastAdded.voltage_v} unit="V" />
+              <StatCard label="电流" value={lastAdded.current_a} unit="A" color="#ff9800" />
+              <StatCard label="剩余容量" value={lastAdded.remaining_ah} unit="Ah" color="#9c27b0" />
+              {lastAdded.cell_voltage_diff_mv != null && <StatCard label="压差" value={lastAdded.cell_voltage_diff_mv} unit="mV" color="#ffcc00" />}
+              <StatCard label="最高温" value={lastAdded.max_temp_c} unit="°C" color="#ff6b6b" />
+            </div>
+          </div>
+        )}
+
+        {/* Records */}
+        {records.length > 0 ? (
+          <div>
+            <div style={{ color: "#446666", fontSize: 10, textTransform: "uppercase", letterSpacing: 1, marginBottom: 8 }}>
+              历史记录（点击展开详情）
+            </div>
+            {records.map((r, i) => (
+              <RecordRow key={r.timestamp + i} record={r} index={i} onDelete={deleteRecord} onUpdateOdometer={updateOdometer} />
+            ))}
+          </div>
+        ) : (
+          <div style={{ textAlign: "center", color: "#333", padding: "48px 0" }}>
+            <div style={{ fontSize: 36, marginBottom: 10 }}>📊</div>
+            <div style={{ fontSize: 13 }}>还没有记录，上传截图开始记录吧</div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+
+<script>
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js').then(reg => {
+      console.log('SW registered:', reg.scope);
+    }).catch(err => console.log('SW error:', err));
+  });
+}
+
+// PWA install prompt
+let deferredPrompt = null;
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  deferredPrompt = e;
+  const banner = document.getElementById('install-banner');
+  if (banner) banner.style.display = 'flex';
+});
+window.addEventListener('appinstalled', () => {
+  const banner = document.getElementById('install-banner');
+  if (banner) banner.style.display = 'none';
+  deferredPrompt = null;
+});
+function installApp() {
+  if (deferredPrompt) {
+    deferredPrompt.prompt();
+    deferredPrompt.userChoice.then(() => { deferredPrompt = null; });
+  }
+}
+</script>
+<div id="install-banner" style="display:none;position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:#0d1a1a;border:1px solid #00e5ff44;border-radius:12px;padding:12px 18px;align-items:center;gap:12px;z-index:9999;box-shadow:0 4px 24px rgba(0,229,255,0.15);max-width:340px;width:calc(100%-32px);">
+  <span style="font-size:22px">🔋</span>
+  <div style="flex:1">
+    <div style="color:#00e5ff;font-weight:700;font-size:13px">安装到主屏幕</div>
+    <div style="color:#556;font-size:11px;margin-top:2px">离线可用，体验更佳</div>
+  </div>
+  <button onclick="installApp()" style="background:linear-gradient(135deg,#00e5ff,#0099bb);color:#000;border:none;border-radius:8px;padding:7px 14px;font-weight:700;font-size:12px;cursor:pointer;">安装</button>
+  <button onclick="document.getElementById('install-banner').style.display='none'" style="background:none;border:none;color:#555;font-size:18px;cursor:pointer;padding:0 4px;">×</button>
+</div>
+
+</body>
+</html>
