@@ -1,13 +1,13 @@
-const CACHE_NAME = "bms-logger-v3";
+const CACHE_NAME = "bms-logger-v4";
 const ASSETS = [
-  "/",
-  "/index.html",
-  "/manifest.json",
-  "/icon-192.png",
-  "/icon-512.png",
-  "https://unpkg.com/react@18/umd/react.production.min.js",
-  "https://unpkg.com/react-dom@18/umd/react-dom.production.min.js",
-  "https://unpkg.com/@babel/standalone/babel.min.js"
+  "./",
+  "./index.html",
+  "./manifest.json",
+  "./icon-192.png",
+  "./icon-512.png",
+  "./react.production.min.js",
+  "./react-dom.production.min.js",
+  "./babel.min.js"
 ];
 
 self.addEventListener("install", (e) => {
@@ -25,7 +25,6 @@ self.addEventListener("activate", (e) => {
 });
 
 self.addEventListener("fetch", (e) => {
-  // API calls: network only, no cache
   if (e.request.url.includes("dmxapi.cn") || e.request.url.includes("anthropic.com")) {
     return;
   }
@@ -37,7 +36,7 @@ self.addEventListener("fetch", (e) => {
         const clone = response.clone();
         caches.open(CACHE_NAME).then((cache) => cache.put(e.request, clone));
         return response;
-      }).catch(() => caches.match("/index.html"));
+      }).catch(() => caches.match("./index.html"));
     })
   );
 });
