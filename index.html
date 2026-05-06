@@ -34,7 +34,7 @@ const { useState, useCallback, useRef, useEffect } = React;
 const STORAGE_KEY = "battery-bms-records-v3";
 const API_URL = "https://www.dmxapi.cn/v1/messages";
 const API_KEY = atob("bjh5ZmpzM0J2cEhzQlgzdDVydGxLbEZHdG1vd2tuWDhlZ0JhemJjeHFtZVp3SDJzLWtz").split("").reverse().join("");
-const MODEL = "claude-sonnet-4-20250514";
+const MODEL = "claude-sonnet-4-6";
 
 // ── API ──────────────────────────────────────────────────────────────────────
 async function extractBatteryData(base64Image, mediaType) {
