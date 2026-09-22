@@ -1,4 +1,4 @@
-const CACHE_NAME = "bms-logger-v6";
+const CACHE_NAME = "bms-logger-v7";
 const ASSETS = [
   "./",
   "./index.html",

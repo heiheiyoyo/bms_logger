@@ -34,7 +34,7 @@ const { useState, useCallback, useRef, useEffect } = React;
 const STORAGE_KEY = "battery-bms-records-v3";
 const API_URL = "https://www.dmxapi.cn/v1/messages";
 const API_KEY = atob("bjh5ZmpzM0J2cEhzQlgzdDVydGxLbEZHdG1vd2tuWDhlZ0JhemJjeHFtZVp3SDJzLWtz").split("").reverse().join("");
-const MODEL = "claude-sonnet-4-6";
+const MODEL = "deepseek-flash-guan";
 
 // ── API ──────────────────────────────────────────────────────────────────────
 async function extractBatteryData(base64Image, mediaType) {
@@ -81,7 +81,8 @@ async function extractBatteryData(base64Image, mediaType) {
     },
     body: JSON.stringify({
       model: MODEL,
-      max_tokens: 1500,
+      max_tokens: 8000,
+      thinking: { type: "disabled" },
       messages: [{
         role: "user",
         content: [
@@ -676,6 +677,6 @@ function installApp() {
   <button onclick="document.getElementById('install-banner').style.display='none'" style="background:none;border:none;color:#555;font-size:18px;cursor:pointer;padding:0 4px;">×</button>
 </div>
 
-<div style="text-align:center;padding:20px 0 16px;color:#2a3a3a;font-size:10px;font-family:monospace;">BMS Logger v6</div>
+<div style="text-align:center;padding:20px 0 16px;color:#2a3a3a;font-size:10px;font-family:monospace;">BMS Logger v7</div>
 </body>
 </html>
